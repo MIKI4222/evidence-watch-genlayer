@@ -174,6 +174,82 @@ def _clean_page_text(raw: str) -> str:
     return text[:MAX_PAGE_CHARS]
 
 
+_MONTHS = {"jan": "jan", "january": "jan", "feb": "feb", "february": "feb", "mar": "mar", "march": "mar",
+           "apr": "apr", "april": "apr", "jun": "jun", "june": "jun", "jul": "jul", "july": "jul",
+           "aug": "aug", "august": "aug", "sep": "sep", "sept": "sep", "september": "sep", "oct": "oct",
+           "october": "oct", "nov": "nov", "november": "nov", "dec": "dec", "december": "dec"}
+_POLARITY = ("not", "no", "never", "cannot", "without", "none")
+_STOPWORDS = {"the", "and", "for", "are", "was", "that", "this", "with", "from", "has", "have", "its", "any", "all"}
+VALUE_MIN_WORDS_PERMILLE = 300  # prose values with no number / date / acronym: minimum word overlap
+SUBJECT_MIN_WORDS_PERMILLE = 250
+TITLE_MIN_WORDS_PERMILLE = 500
+
+
+def _numbers(text: str) -> set:
+    out = set()
+    for m in re.findall(r"(?<![\w.])\d+(?:[.,]\d+)*", text or ""):
+        n = m.replace(",", "")
+        whole, dot, frac = n.partition(".")
+        out.add((whole.lstrip("0") or "0") + dot + frac)
+    return out
+
+
+def _months(text: str) -> set:
+    out = set()
+    for w in re.findall(r"[A-Za-z]+", text or ""):
+        if w.lower() in _MONTHS:
+            out.add(_MONTHS[w.lower()])
+    if re.search(r"(?i)\b\d{1,2}(?:st|nd|rd|th)?\s+may\b|\bmay\s+\d{1,2}\b", text or ""):
+        out.add("may")  # "may" only counts as a month next to a day number (it is also a common verb)
+    return out
+
+
+def _acronyms(text: str) -> set:
+    return set(re.findall(r"\b[A-Z][A-Z0-9]+\b", text or ""))
+
+
+def _key_tokens(text: str) -> frozenset:
+    """Hard facts a value states: numbers, month names, ALL-CAPS acronyms and negations. Two values
+    that disagree on any of these (for example two different deadlines) are not the same fact."""
+    toks = {"n:" + x for x in _numbers(text)} | {"m:" + x for x in _months(text)} | {"a:" + x for x in _acronyms(text)}
+    toks |= {"p:" + w for w in re.findall(r"[a-z]+", (text or "").lower()) if w in _POLARITY}
+    return frozenset(toks)
+
+
+def _words(text: str) -> set:
+    return {w for w in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(w) >= 3 and w not in _STOPWORDS}
+
+
+def _jaccard_permille(a: set, b: set) -> int:
+    if not a or not b:
+        return 0
+    return len(a & b) * 1000 // len(a | b)
+
+
+def _bound(a: str, b: str, min_words_permille: int) -> bool:
+    """Do two independently extracted statements bind to the same stored fact? Both empty: yes.
+    If either states hard facts (numbers, months, acronyms, negations) they must match exactly;
+    otherwise (pure prose) the word overlap must reach the threshold."""
+    if a == "" or b == "":
+        return a == b
+    ka, kb = _key_tokens(a), _key_tokens(b)
+    if ka or kb:
+        return ka == kb
+    return _jaccard_permille(_words(a), _words(b)) >= min_words_permille
+
+
+def _grounded(value: str, page_text: str) -> bool:
+    """The hard facts in a value (numbers, months, acronyms) must literally occur in the page."""
+    page_words = set(re.findall(r"[a-z0-9]+", (page_text or "").lower()))
+    return (_numbers(value) <= _numbers(page_text) and _months(value) <= _months(page_text)
+            and all(a.lower() in page_words for a in _acronyms(value)))
+
+
+def _leader_values_grounded(leader: dict, page_text: str, key: str) -> bool:
+    """Every value the leader stored must be grounded in the validator's own copy of the page."""
+    return all(_grounded(it["value"], page_text) for it in leader["items"] if it.get(key) and it.get("value"))
+
+
 def _item_class(base_present: bool, now_present: bool, model_change: str) -> str:
     """Per-item classification, derived from presence bits; the model only
     contributes its judgement when the item exists both before and now."""
@@ -233,7 +309,7 @@ def _common_fields(raw: dict) -> dict:
     }
 
 
-def _normalize_baseline(raw, watch_items: list) -> dict:
+def _normalize_baseline(raw, watch_items: list, page_text: str) -> dict:
     if not isinstance(raw, dict):
         raise gl.vm.UserError(f"{ERR_LLM} model returned {type(raw).__name__}, expected object")
     items_raw = raw.get("items")
@@ -244,8 +320,12 @@ def _normalize_baseline(raw, watch_items: list) -> dict:
         if not isinstance(it, dict):
             raise gl.vm.UserError(f"{ERR_LLM} items entries must be objects")
         present = _as_bool(it.get("present"), "present")
-        items.append({"item": watch, "present": present,
-                      "value": _clip(it.get("value"), MAX_VALUE_CHARS) if present else ""})
+        value = _clip(it.get("value"), MAX_VALUE_CHARS) if present else ""
+        if present and not value:
+            raise gl.vm.UserError(f"{ERR_LLM} item '{watch[:40]}' is present but has no value")
+        if value and not _grounded(value, page_text):
+            raise gl.vm.UserError(f"{ERR_LLM} value for '{watch[:40]}' states numbers, dates or terms that are not in the page")
+        items.append({"item": watch, "present": present, "value": value})
     out = {"status": BASELINE_STATUS, "page_accessible": True, "subject_changed": False,
            "summary": _clip(raw.get("summary"), MAX_SUMMARY_CHARS), "items": items,
            "important_findings": []}
@@ -253,7 +333,7 @@ def _normalize_baseline(raw, watch_items: list) -> dict:
     return out
 
 
-def _normalize_check(raw, base_items: list) -> dict:
+def _normalize_check(raw, base_items: list, page_text: str) -> dict:
     """Canonical check result. The model supplies per-item judgements; the
     per-item class and the overall status are computed here."""
     if not isinstance(raw, dict):
@@ -267,12 +347,17 @@ def _normalize_check(raw, base_items: list) -> dict:
             raise gl.vm.UserError(f"{ERR_LLM} items entries must be objects")
         now_present = _as_bool(it.get("present_now"), "present_now")
         model_change = _clip(it.get("change"), 20).upper()
+        new_value = _clip(it.get("new_value"), MAX_VALUE_CHARS) if now_present else ""
+        if now_present and not new_value:
+            raise gl.vm.UserError(f"{ERR_LLM} item '{base['item'][:40]}' is present now but has no value")
+        if new_value and not _grounded(new_value, page_text):
+            raise gl.vm.UserError(f"{ERR_LLM} new value for '{base['item'][:40]}' states numbers, dates or terms that are not in the page")
         items.append({
             "item": base["item"],
             "base_present": bool(base["present"]),
             "present_now": now_present,
             "change": _item_class(bool(base["present"]), now_present, model_change),
-            "value": _clip(it.get("new_value"), MAX_VALUE_CHARS) if now_present else "",
+            "value": new_value,
             "note": _clip(it.get("note"), MAX_NOTE_CHARS),
         })
     subject_changed = raw.get("subject_changed")
@@ -376,24 +461,39 @@ def _check_is_valid(data, base_items: list) -> bool:
 
 
 def _baseline_equivalent(a: dict, b: dict) -> bool:
-    """Compared: status, accessibility, and for every watch item whether the page
-    states it. NOT compared: values, title, subject, summary, type, confidence."""
+    """Everything a later check relies on is bound, not just presence. Compared: status,
+    accessibility, per watch item whether the page states it AND the stored value (hard facts such
+    as numbers, dates, months, acronyms and negations must match exactly; pure prose must overlap),
+    plus the page subject and title (the baseline subject is what `subject_changed` is judged
+    against later). NOT compared: summary, source type, version / date text, confidence."""
     if a["status"] != b["status"] or a["page_accessible"] != b["page_accessible"]:
         return False
     if len(a["items"]) != len(b["items"]):
         return False
-    return all(x["present"] == y["present"] for x, y in zip(a["items"], b["items"]))
+    for x, y in zip(a["items"], b["items"]):
+        if x["present"] != y["present"] or not _bound(x["value"], y["value"], VALUE_MIN_WORDS_PERMILLE):
+            return False
+    if a["status"] != BASELINE_STATUS:
+        return True
+    return _bound(a["subject"], b["subject"], SUBJECT_MIN_WORDS_PERMILLE) and _bound(a["title"], b["title"], TITLE_MIN_WORDS_PERMILLE)
 
 
 def _check_equivalent(a: dict, b: dict) -> bool:
-    """Compared: overall status, accessibility, whole-subject change and the
-    per-item class (which encodes added / removed / modified / minor / unclear).
-    NOT compared: values, notes, findings, summaries, confidence."""
+    """Compared: overall status, accessibility, whole-subject change and the per-item class, and
+    for every item present now the stored value (same binding rule as the baseline). When the result
+    will REPLACE the baseline (MINOR_CHANGE / MATERIAL_CHANGE) the subject and title that become the
+    next baseline are bound as well. NOT compared: notes, findings, summaries, confidence."""
     if a["status"] != b["status"] or a["page_accessible"] != b["page_accessible"]:
         return False
     if a["subject_changed"] != b["subject_changed"] or len(a["items"]) != len(b["items"]):
         return False
-    return all(x["change"] == y["change"] for x, y in zip(a["items"], b["items"]))
+    if not all(x["change"] == y["change"] for x, y in zip(a["items"], b["items"])):
+        return False
+    if not all(_bound(x["value"], y["value"], VALUE_MIN_WORDS_PERMILLE) for x, y in zip(a["items"], b["items"])):
+        return False
+    if a["status"] in ("MINOR_CHANGE", "MATERIAL_CHANGE"):
+        return _bound(a["subject"], b["subject"], SUBJECT_MIN_WORDS_PERMILLE) and _bound(a["title"], b["title"], TITLE_MIN_WORDS_PERMILLE)
+    return True
 
 
 def _security_block() -> str:
@@ -430,8 +530,8 @@ PAGE>>>
 
 Create a compact baseline snapshot. For each of the {n} watch items, in order:
 - present: true only if the page explicitly states something about that item.
-- value: a short factual statement (max {MAX_VALUE_CHARS} characters) of what the page says; empty if not present.
-Also provide title, source_type (one of {", ".join(SOURCE_TYPES)}), subject (what the page is about, max 120 chars), summary (max 300 chars), confidence (integer 0-100, informational). version_info and observed_date: copy them ONLY if the page text explicitly states a version or a publication/update date; otherwise leave them as "". Never guess or infer a date.
+- value: REQUIRED when present: a short statement (max {MAX_VALUE_CHARS} characters) that reuses the page's own words and copies every number, date, month, name and acronym EXACTLY as written (never paraphrase or convert them); empty if not present.
+Also provide title, source_type (one of {", ".join(SOURCE_TYPES)}), subject (what the page is about, max 120 chars, using the page's own key terms), summary (max 300 chars), confidence (integer 0-100, informational). version_info and observed_date: copy them ONLY if the page text explicitly states a version or a publication/update date; otherwise leave them as "". Never guess or infer a date.
 
 Return ONLY this JSON object with exactly {n} entries in items:
 {{
@@ -467,7 +567,7 @@ Compare the current page with the baseline, for each of the {n} watch items, in 
   * MODIFIED: the meaning or a value, date, number, requirement, deliverable or obligation changed.
   * UNCLEAR: ONLY if the current content is truncated or ambiguous so you cannot tell.
   Use UNCHANGED when absent in both. If the page is fully shown and the information is simply different, that is MODIFIED (not UNCLEAR).
-- new_value: short statement of what the current page says (max {MAX_VALUE_CHARS} chars; empty if not present_now).
+- new_value: REQUIRED when present_now: a short statement (max {MAX_VALUE_CHARS} chars) that reuses the page's own words and copies every number, date, month, name and acronym EXACTLY as written; empty if not present_now.
 - note: one short sentence about the difference (optional).
 Also: subject_changed = true ONLY if the page is now about a clearly different subject than the baseline subject (not merely reworded or extended). important_findings = up to {MAX_FINDINGS} short notable observations. change_summary (max 300 chars), title, source_type (one of {", ".join(SOURCE_TYPES)}), subject, confidence (integer 0-100, informational). version_info and observed_date: copy them ONLY if the page text explicitly states a version or a publication/update date; otherwise leave them as "". Never guess or infer a date.
 
@@ -515,24 +615,25 @@ def _fetch_page(url: str) -> dict:
     return {"ok": ok, "status": status, "text": text, "empty": ok and len(text) < MIN_PAGE_CHARS}
 
 
-def _assess_baseline(ctx: dict) -> dict:
+def _assess_baseline(ctx: dict) -> tuple:
+    """Returns (result, page_text); the text is what this node saw (used to ground stored values)."""
     page = _fetch_page(ctx["url"])
     if not page["ok"]:
-        return _empty_result("SOURCE_UNAVAILABLE", False, f"Source could not be retrieved (HTTP status {page['status']}).")
+        return _empty_result("SOURCE_UNAVAILABLE", False, f"Source could not be retrieved (HTTP status {page['status']})."), ""
     if page["empty"]:
-        return _empty_result("INCONCLUSIVE", True, "Source returned an empty or near-empty page.")
+        return _empty_result("INCONCLUSIVE", True, "Source returned an empty or near-empty page."), page["text"]
     raw = gl.nondet.exec_prompt(_build_baseline_prompt(ctx, page["text"]), response_format="json")
-    return _normalize_baseline(raw, ctx["watch_items"])
+    return _normalize_baseline(raw, ctx["watch_items"], page["text"]), page["text"]
 
 
-def _assess_check(ctx: dict) -> dict:
+def _assess_check(ctx: dict) -> tuple:
     page = _fetch_page(ctx["url"])
     if not page["ok"]:
-        return _empty_result("SOURCE_UNAVAILABLE", False, f"Source could not be retrieved (HTTP status {page['status']}).")
+        return _empty_result("SOURCE_UNAVAILABLE", False, f"Source could not be retrieved (HTTP status {page['status']})."), ""
     if page["empty"]:
-        return _empty_result("INCONCLUSIVE", True, "Source returned an empty or near-empty page.")
+        return _empty_result("INCONCLUSIVE", True, "Source returned an empty or near-empty page."), page["text"]
     raw = gl.nondet.exec_prompt(_build_check_prompt(ctx, page["text"]), response_format="json")
-    return _normalize_check(raw, ctx["baseline_items"])
+    return _normalize_check(raw, ctx["baseline_items"], page["text"]), page["text"]
 
 
 # --------------------------------------------------------------------------- #
@@ -776,7 +877,7 @@ class EvidenceWatch(gl.contract.Contract):
         watch_items = ctx["watch_items"]
 
         def leader_fn() -> dict:
-            return _assess_baseline(ctx)
+            return _assess_baseline(ctx)[0]
 
         def validator_fn(leaders_res) -> bool:
             if not isinstance(leaders_res, gl.vm.Return):
@@ -785,9 +886,11 @@ class EvidenceWatch(gl.contract.Contract):
             if not _baseline_is_valid(leader_data, watch_items):
                 return False
             try:
-                mine = _assess_baseline(ctx)  # independent fetch + judgement
+                mine, my_text = _assess_baseline(ctx)  # independent fetch + judgement
             except Exception:
                 return False
+            if not _leader_values_grounded(leader_data, my_text, "present"):
+                return False  # a stored value must be found in this validator's own copy of the page
             return _baseline_equivalent(leader_data, mine)
 
         result = _run_nondet(leader_fn, validator_fn)
@@ -826,7 +929,7 @@ class EvidenceWatch(gl.contract.Contract):
         base_items = baseline["items"]
 
         def leader_fn() -> dict:
-            return _assess_check(ctx)
+            return _assess_check(ctx)[0]
 
         def validator_fn(leaders_res) -> bool:
             if not isinstance(leaders_res, gl.vm.Return):
@@ -835,8 +938,10 @@ class EvidenceWatch(gl.contract.Contract):
             if not _check_is_valid(leader_data, base_items):
                 return False
             try:
-                mine = _assess_check(ctx)  # independent fetch + comparison against the same baseline
+                mine, my_text = _assess_check(ctx)  # independent fetch + comparison against the same baseline
             except Exception:
+                return False
+            if not _leader_values_grounded(leader_data, my_text, "present_now"):
                 return False
             return _check_equivalent(leader_data, mine)
 
