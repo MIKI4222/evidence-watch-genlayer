@@ -107,7 +107,7 @@ Not re-run live on the revised version: `UNCHANGED`, `SOURCE_UNAVAILABLE`, injec
 | `check_source`, page served from a stale cache | `UNCHANGED`, all items `UNCHANGED`, baseline kept (version 2 recorded) |
 | `check_source`, deadline changed 15 -> 20 Nov | `MATERIAL_CHANGE`; `modified_information` and `affected_requirements` list the deadline; baseline replaced (version 3); baseline `summary` reads "Updated in version 3: ..." (no stale text) |
 
-Transaction hashes for these runs: see the transaction history of the deployed contract at `0x402af6154B9D64635e2c32FEB9f07D4A492532F4`.
+Transaction hashes for these runs: see the transaction history of the deployed contract at `0xe377EBA9359CA71Ad64D4BB65e5BC0Ff897aC3D8`.
 
 **Even earlier version (before two small fixes), 5 Nov 2026**
 
